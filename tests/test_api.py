@@ -393,5 +393,198 @@ class TestChapterImposeEndpoint(unittest.TestCase):
                 self.assertIn("details", body)
 
 
+class TestBindingCheckEndpoint(unittest.TestCase):
+    URL = "/api/v1/binding-check"
+
+    @staticmethod
+    def _sheet(fl, fr, bl, br):
+        return {"front": {"left": fl, "right": fr}, "back": {"left": bl, "right": br}}
+
+    def _payload(self, sheets, **overrides):
+        payload = {
+            "total_pages": 16,
+            "max_sheets_per_booklet": 4,
+            "booklet_index": 0,
+            "sheets": sheets,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_valid_in_order_request(self):
+        sheets = [
+            self._sheet(16, 1, 2, 15),
+            self._sheet(14, 3, 4, 13),
+            self._sheet(12, 5, 6, 11),
+            self._sheet(10, 7, 8, 9),
+        ]
+        resp = client.post(self.URL, json=self._payload(sheets))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["sheet_count"], 4)
+        self.assertEqual(data["swap_count"], 0)
+        self.assertEqual(data["swap_steps"], [])
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"]) for s in data["sheets"]],
+            [(0, 0), (1, 1), (2, 2), (3, 3)],
+        )
+        self.assertTrue(all(s["operations"] == [] for s in data["sheets"]))
+
+    def test_valid_shuffled_request_with_operations(self):
+        sheets = [
+            self._sheet(14, 3, 4, 13),  # 应在 1
+            self._sheet(2, 15, 16, 1),  # 应在 0，需正反互换
+            self._sheet(10, 7, 8, 9),  # 应在 3
+            self._sheet(5, 12, 11, 6),  # 应在 2，需左右互换
+        ]
+        resp = client.post(self.URL, json=self._payload(sheets))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"]) for s in data["sheets"]],
+            [(0, 1), (1, 0), (2, 3), (3, 2)],
+        )
+        self.assertEqual(
+            [s["operations"] for s in data["sheets"]],
+            [[], ["front_back"], [], ["left_right"]],
+        )
+        self.assertEqual(data["swap_count"], 2)
+        self.assertEqual(data["swap_steps"], [[0, 1], [2, 3]])
+
+    def test_valid_request_with_blank_pages(self):
+        sheets = [
+            self._sheet(None, 3, 4, 5),
+            self._sheet(None, 1, 2, None),
+        ]
+        resp = client.post(
+            self.URL,
+            json=self._payload(sheets, total_pages=5, max_sheets_per_booklet=10),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"]) for s in data["sheets"]],
+            [(0, 1), (1, 0)],
+        )
+        self.assertEqual(data["swap_steps"], [[0, 1]])
+
+    def _assert_400(self, payload):
+        resp = client.post(self.URL, json=payload)
+        self.assertEqual(resp.status_code, 400, resp.text)
+        body = resp.json()
+        self.assertEqual(body["error"], "invalid_input")
+        self.assertIn("message", body)
+        self.assertIn("details", body)
+        return body
+
+    def test_missing_sheet_400(self):
+        body = self._assert_400(
+            self._payload(
+                [
+                    self._sheet(16, 1, 2, 15),
+                    self._sheet(14, 3, 4, 13),
+                    self._sheet(12, 5, 6, 11),
+                ]
+            )
+        )
+        self.assertIn("缺纸", body["message"])
+
+    def test_duplicate_sheet_400(self):
+        sheets = [
+            self._sheet(16, 1, 2, 15),
+            self._sheet(14, 3, 4, 13),
+            self._sheet(12, 5, 6, 11),
+            self._sheet(12, 5, 6, 11),
+        ]
+        body = self._assert_400(self._payload(sheets))
+        self.assertIn("重复纸", body["message"])
+
+    def test_cross_booklet_page_400(self):
+        sheets = [
+            self._sheet(16, 1, 2, 15),
+            self._sheet(14, 3, 4, 13),
+            self._sheet(12, 5, 6, 11),
+            self._sheet(10, 7, 8, 17),
+        ]
+        body = self._assert_400(self._payload(sheets))
+        self.assertIn("跨册页", body["message"])
+
+    def test_unrestorable_layout_400(self):
+        sheets = [
+            self._sheet(16, 1, 2, 15),
+            self._sheet(14, 3, 4, 13),
+            self._sheet(12, 5, 6, 11),
+            self._sheet(10, 7, 9, 8),  # 仅反面左右对调，无法还原
+        ]
+        body = self._assert_400(self._payload(sheets))
+        self.assertIn("无法通过左右互换及正反互换还原", body["message"])
+
+    def test_booklet_index_out_of_range_400(self):
+        body = self._assert_400(
+            self._payload(
+                [self._sheet(16, 1, 2, 15)], booklet_index=1
+            )
+        )
+        self.assertIn("booklet_index 越界", body["message"])
+        self.assertTrue(any(d["field"] == "booklet_index" for d in body["details"]))
+
+    def test_invalid_payloads_400(self):
+        good = [
+            self._sheet(16, 1, 2, 15),
+            self._sheet(14, 3, 4, 13),
+            self._sheet(12, 5, 6, 11),
+            self._sheet(10, 7, 8, 9),
+        ]
+        cases = [
+            {},  # 全缺
+            self._payload(good, booklet_index=-1),  # 册序号为负
+            self._payload(good, booklet_index=0.5),  # 册序号小数
+            self._payload(good, booklet_index="0"),  # 册序号字符串
+            self._payload(good, total_pages=0),  # 总页数非正
+            self._payload(good, max_sheets_per_booklet=True),  # 布尔值
+            {  # sheets 非数组
+                "total_pages": 16,
+                "max_sheets_per_booklet": 4,
+                "booklet_index": 0,
+                "sheets": "not-a-list",
+            },
+            {  # 纸张非对象
+                "total_pages": 16,
+                "max_sheets_per_booklet": 4,
+                "booklet_index": 0,
+                "sheets": [[1, 2], [3, 4], [5, 6], [7, 8]],
+            },
+            self._payload(good, duplex=True),  # 多余字段
+            self._payload(
+                [self._sheet(16, 1, 2, 15), self._sheet(14, 3, 4, 13),
+                 self._sheet(12, 5, 6, 11), self._sheet(10, 7, 8, "9")]
+            ),  # 页码为字符串
+            self._payload(
+                [self._sheet(16, 1, 2, 15), self._sheet(14, 3, 4, 13),
+                 self._sheet(12, 5, 6, 11), self._sheet(10, 7, 8, 9.0)]
+            ),  # 页码为浮点
+            self._payload(
+                [self._sheet(16, 1, 2, 15), self._sheet(14, 3, 4, 13),
+                 self._sheet(12, 5, 6, 11), self._sheet(10, 7, 8, 0)]
+            ),  # 页码非正
+            self._payload(
+                [self._sheet(16, 1, 2, 15), self._sheet(14, 3, 4, 13),
+                 self._sheet(12, 5, 6, 11), {"front": {"left": 10, "right": 7}}]
+            ),  # 缺少 back
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                self._assert_400(payload)
+
+    def test_error_format_matches_existing_endpoints(self):
+        resp = client.post(self.URL, json={"total_pages": 0})
+        self.assertEqual(resp.status_code, 400)
+        body = resp.json()
+        self.assertEqual(set(body.keys()), {"error", "message", "details"})
+        self.assertEqual(body["error"], "invalid_input")
+        self.assertTrue(
+            all(set(d.keys()) == {"field", "message"} for d in body["details"])
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

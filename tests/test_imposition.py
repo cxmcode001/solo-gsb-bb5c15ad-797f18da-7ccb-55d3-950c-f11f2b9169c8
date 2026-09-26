@@ -3,7 +3,10 @@
 import unittest
 
 from app.imposition import (
+    BindingCheckError,
     ChapterTooLargeError,
+    _min_swap_steps,
+    build_binding_check,
     build_chapter_imposition,
     build_imposition,
     build_reprint,
@@ -405,6 +408,188 @@ class TestBuildReprint(unittest.TestCase):
         result = build_reprint(16, 4, [(15, 16)])
         self.assertEqual(result["total_pages"], 16)
         self.assertEqual(result["max_sheets_per_booklet"], 4)
+
+
+def _sheet(front_left, front_right, back_left, back_right):
+    """构造一条待核对纸张记录。"""
+    return {
+        "front": {"left": front_left, "right": front_right},
+        "back": {"left": back_left, "right": back_right},
+    }
+
+
+# 16 页、每册 4 张纸 -> 单册基准拼版（从外到内）
+BOOKLET_16 = [
+    _sheet(16, 1, 2, 15),
+    _sheet(14, 3, 4, 13),
+    _sheet(12, 5, 6, 11),
+    _sheet(10, 7, 8, 9),
+]
+
+
+class TestMinSwapSteps(unittest.TestCase):
+    def test_already_sorted_needs_no_swap(self):
+        self.assertEqual(_min_swap_steps([0, 1, 2, 3]), [])
+
+    def test_single_transposition(self):
+        self.assertEqual(_min_swap_steps([1, 0, 2]), [[0, 1]])
+
+    def test_two_disjoint_transpositions(self):
+        self.assertEqual(_min_swap_steps([1, 0, 3, 2]), [[0, 1], [2, 3]])
+
+    def test_rotation_uses_min_steps_and_lex_order(self):
+        # 循环 0->2->1->0 最少 2 步；可行首步为 (0,1)/(0,2)/(1,2)，
+        # 字典序最小的步骤序列为 [(0,1),(1,2)]（而非 [(0,2),(0,1)]）
+        self.assertEqual(_min_swap_steps([2, 0, 1]), [[0, 1], [1, 2]])
+
+    def test_four_cycle_lexicographic_sequence(self):
+        self.assertEqual(_min_swap_steps([1, 2, 3, 0]), [[0, 1], [0, 2], [0, 3]])
+
+    def test_step_count_matches_cycle_formula(self):
+        # 最少步数 = 纸张数 - 循环数
+        self.assertEqual(len(_min_swap_steps([3, 2, 1, 0])), 2)
+        self.assertEqual(len(_min_swap_steps([2, 3, 0, 1])), 2)
+
+
+class TestBuildBindingCheck(unittest.TestCase):
+    def test_in_order_sheets_need_nothing(self):
+        result = build_binding_check(16, 4, 0, BOOKLET_16)
+        self.assertEqual(result["sheet_count"], 4)
+        self.assertEqual(result["booklet_count"], 1)
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"]) for s in result["sheets"]],
+            [(0, 0), (1, 1), (2, 2), (3, 3)],
+        )
+        self.assertTrue(all(s["operations"] == [] for s in result["sheets"]))
+        self.assertEqual(result["swap_count"], 0)
+        self.assertEqual(result["swap_steps"], [])
+
+    def test_shuffled_sheets_positions_and_min_swaps(self):
+        shuffled = [BOOKLET_16[1], BOOKLET_16[0], BOOKLET_16[3], BOOKLET_16[2]]
+        result = build_binding_check(16, 4, 0, shuffled)
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"]) for s in result["sheets"]],
+            [(0, 1), (1, 0), (2, 3), (3, 2)],
+        )
+        self.assertEqual(result["swap_count"], 2)
+        self.assertEqual(result["swap_steps"], [[0, 1], [2, 3]])
+
+    def test_orientation_operations_detected(self):
+        sheets = [
+            _sheet(1, 16, 15, 2),  # 第 0 张左右互换
+            _sheet(4, 13, 14, 3),  # 第 1 张正反互换
+            _sheet(11, 6, 5, 12),  # 第 2 张左右 + 正反
+            BOOKLET_16[3],  # 第 3 张原样
+        ]
+        result = build_binding_check(16, 4, 0, sheets)
+        self.assertEqual(
+            [s["operations"] for s in result["sheets"]],
+            [["left_right"], ["front_back"], ["left_right", "front_back"], []],
+        )
+        # 各纸位置正确，无需交换
+        self.assertEqual(result["swap_steps"], [])
+
+    def test_pages_identified_by_non_empty_set(self):
+        result = build_binding_check(16, 4, 0, BOOKLET_16)
+        self.assertEqual(
+            [s["pages"] for s in result["sheets"]],
+            [[1, 2, 15, 16], [3, 4, 13, 14], [5, 6, 11, 12], [7, 8, 9, 10]],
+        )
+
+    def test_blank_pages_are_part_of_identity(self):
+        # 5 页补齐到 8：外纸含两个补白位，按非空页码集合 {1, 2} / {3, 4, 5} 识别
+        sheets = [
+            _sheet(None, 3, 4, 5),  # 内纸被放到了最外
+            _sheet(None, 1, 2, None),  # 外纸
+        ]
+        result = build_binding_check(5, 10, 0, sheets)
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"]) for s in result["sheets"]],
+            [(0, 1), (1, 0)],
+        )
+        self.assertEqual(result["sheets"][0]["pages"], [3, 4, 5])
+        self.assertEqual(result["sheets"][1]["pages"], [1, 2])
+        self.assertEqual(result["swap_steps"], [[0, 1]])
+
+    def test_multi_booklet_checks_selected_booklet(self):
+        # 17 页、每册 2 张纸 -> 3 册；核对第 2 册（全局页码 9..16）
+        sheets = [_sheet(14, 11, 12, 13), _sheet(16, 9, 10, 15)]
+        result = build_binding_check(17, 2, 1, sheets)
+        self.assertEqual(result["booklet_count"], 3)
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"]) for s in result["sheets"]],
+            [(0, 1), (1, 0)],
+        )
+        self.assertEqual(result["swap_steps"], [[0, 1]])
+
+    def test_missing_sheet_rejected(self):
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(16, 4, 0, BOOKLET_16[:3])
+        self.assertIn("缺纸", str(ctx.exception))
+
+    def test_extra_sheet_rejected(self):
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(16, 4, 0, BOOKLET_16 + [BOOKLET_16[0]])
+        self.assertIn("超出", str(ctx.exception))
+
+    def test_duplicate_sheet_rejected(self):
+        sheets = BOOKLET_16[:3] + [BOOKLET_16[2]]
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(16, 4, 0, sheets)
+        self.assertIn("重复纸", str(ctx.exception))
+
+    def test_cross_booklet_page_rejected(self):
+        # 17 页、每册 2 张纸：第 0 册页码范围为 1..8，混入第 9 页即跨册
+        sheets = [_sheet(8, 1, 2, 7), _sheet(6, 3, 4, 9)]
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(17, 2, 0, sheets)
+        self.assertIn("跨册页", str(ctx.exception))
+
+    def test_page_beyond_total_pages_rejected_as_cross_booklet(self):
+        sheets = BOOKLET_16[:3] + [_sheet(10, 7, 8, 99)]
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(16, 4, 0, sheets)
+        self.assertIn("跨册页", str(ctx.exception))
+
+    def test_unrestorable_layout_rejected(self):
+        # 仅反面左右互换（10,7 / 9,8）不在左右互换、正反互换及其组合之内
+        sheets = BOOKLET_16[:3] + [_sheet(10, 7, 9, 8)]
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(16, 4, 0, sheets)
+        self.assertIn("无法通过左右互换及正反互换还原", str(ctx.exception))
+
+    def test_unknown_page_combination_rejected(self):
+        # 页码都在本册，但组合与任何一张纸都不符
+        sheets = BOOKLET_16[:3] + [_sheet(1, 2, 3, 4)]
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(16, 4, 0, sheets)
+        self.assertIn("不符", str(ctx.exception))
+
+    def test_all_blank_sheet_rejected(self):
+        sheets = BOOKLET_16[:3] + [_sheet(None, None, None, None)]
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(16, 4, 0, sheets)
+        self.assertIn("全部为空白", str(ctx.exception))
+
+    def test_repeated_page_within_sheet_rejected(self):
+        sheets = BOOKLET_16[:3] + [_sheet(10, 7, 8, 8)]
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(16, 4, 0, sheets)
+        self.assertIn("重复", str(ctx.exception))
+
+    def test_booklet_index_out_of_range_rejected(self):
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(16, 4, 1, BOOKLET_16)
+        self.assertIn("booklet_index 越界", str(ctx.exception))
+        self.assertEqual(ctx.exception.field, "booklet_index")
+
+    def test_summary_fields(self):
+        result = build_binding_check(17, 2, 2, [_sheet(None, 17, None, None)])
+        self.assertEqual(result["total_pages"], 17)
+        self.assertEqual(result["max_sheets_per_booklet"], 2)
+        self.assertEqual(result["booklet_index"], 2)
+        self.assertEqual(result["sheet_count"], 1)
+        self.assertEqual(result["sheets"][0]["pages"], [17])
 
 
 if __name__ == "__main__":

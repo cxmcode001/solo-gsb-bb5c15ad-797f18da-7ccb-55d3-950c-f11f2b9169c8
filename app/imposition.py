@@ -17,6 +17,11 @@
 另支持按章节分册（``build_chapter_imposition``）：章节不可拆分、仅相邻章节
 可合册，在每册页数不超过 ``4 * max_sheets_per_booklet`` 的所有方案中依次最小化
 总纸张数与册数，并以各册结束章节序号序列的字典序裁决并列。
+
+装订核对（``build_binding_check``）：以现有拼版结果为基准，按每张纸的非空页码
+集合识别纸张，核对一册待装订纸张是否缺纸、重复、混入跨册页或版面无法通过
+左右互换及正反互换还原；对有效输入给出各纸当前与应在位置、所需互换操作，
+以及恢复外到内顺序的最少两两交换步骤（等长方案按步骤序列字典序取最小）。
 """
 
 from __future__ import annotations
@@ -36,6 +41,14 @@ class ChapterTooLargeError(ValueError):
             f"第 {chapter} 章共 {pages} 页，超过单册容量上限 {capacity} 页"
             "（4 × max_sheets_per_booklet），章节不可拆分。"
         )
+
+
+class BindingCheckError(ValueError):
+    """装订核对失败：缺纸、重复纸、跨册页、版面无法还原或分册序号越界。"""
+
+    def __init__(self, message: str, field: str = "sheets") -> None:
+        self.field = field
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -352,4 +365,179 @@ def build_reprint(
         "booklet_count": imposition["booklet_count"],
         "reprint_sheet_count": len(sheets_out),
         "sheets": sheets_out,
+    }
+
+
+def _sheet_slots(sheet: dict) -> tuple[int | None, int | None, int | None, int | None]:
+    """一张记录纸的 4 个版面：(正面左, 正面右, 反面左, 反面右)。"""
+    return (
+        sheet["front"]["left"],
+        sheet["front"]["right"],
+        sheet["back"]["left"],
+        sheet["back"]["right"],
+    )
+
+
+def _orientation_operations(expected: dict, recorded: dict) -> list[str] | None:
+    """判断记录版面能否由基准版面经左右互换、正反互换还原。
+
+    两个操作可交换、各自幂等，组合出 4 种朝向；由于每张纸至少有一个非空页码
+    且页码互不重复，4 种朝向两两不同，命中时操作组合唯一。返回所需操作列表
+    （可能为空），四种朝向都不匹配时返回 ``None``。
+    """
+    fl, fr, bl, br = _sheet_slots(expected)
+    candidates = (
+        ((), (fl, fr, bl, br)),  # 原样
+        (("left_right",), (fr, fl, br, bl)),  # 左右互换（正反两面同时）
+        (("front_back",), (bl, br, fl, fr)),  # 正反互换
+        (("left_right", "front_back"), (br, bl, fr, fl)),  # 两者叠加
+    )
+    recorded_slots = _sheet_slots(recorded)
+    for operations, slots in candidates:
+        if slots == recorded_slots:
+            return list(operations)
+    return None
+
+
+def _min_swap_steps(arrangement: Sequence[int]) -> list[list[int]]:
+    """把当前叠放顺序还原为外到内顺序的最少两两交换步骤。
+
+    ``arrangement[p]`` 为当前第 ``p`` 张纸（从外到内）应在的位置。每步交换两个
+    位置上的纸；最少步数 = 纸张数 − 排列循环数，且每步必须作用于同一循环内部。
+    在所有最少步数方案中，按步骤序列字典序取最小（每步记为升序位置对）：
+    贪心地在每一轮选取仍处于同一循环中的最小位置对即可。
+    """
+    current = list(arrangement)
+    steps: list[list[int]] = []
+    while True:
+        best: tuple[int, int] | None = None
+        seen = [False] * len(current)
+        for start in range(len(current)):
+            if seen[start]:
+                continue
+            cycle: list[int] = []
+            node = start
+            while not seen[node]:
+                seen[node] = True
+                cycle.append(node)
+                node = current[node]
+            if len(cycle) < 2:
+                continue
+            ordered = sorted(cycle)
+            for i in range(len(ordered)):
+                for j in range(i + 1, len(ordered)):
+                    pair = (ordered[i], ordered[j])
+                    if best is None or pair < best:
+                        best = pair
+        if best is None:
+            return steps
+        a, b = best
+        current[a], current[b] = current[b], current[a]
+        steps.append([a, b])
+
+
+def build_binding_check(
+    total_pages: int,
+    max_sheets_per_booklet: int,
+    booklet_index: int,
+    sheets: Sequence[dict],
+) -> dict:
+    """核对一册待装订纸张：以现有拼版结果为基准，按非空页码集合识别纸张。
+
+    ``sheets`` 为按当前从外到内顺序记录的纸张，每张给出正反面左右原稿页码
+    （补白为 ``None``）。以下情况抛出 :class:`BindingCheckError`（由 API 层转为
+    HTTP 400）：分册序号越界、缺纸或多纸、重复纸、跨册页（含不属于任何册的
+    页码）、以及无法通过左右互换及正反互换还原的版面。
+
+    有效输入返回各纸当前与应在位置、还原各纸版面所需的互换操作，以及恢复
+    外到内顺序的最少两两交换步骤（等长方案按步骤序列字典序取最小）。
+    """
+    imposition = build_imposition(total_pages, max_sheets_per_booklet)
+    booklet_count = imposition["booklet_count"]
+    if not 0 <= booklet_index < booklet_count:
+        raise BindingCheckError(
+            f"booklet_index 越界：共分出 {booklet_count} 册，"
+            f"有效范围为 0 到 {booklet_count - 1}。",
+            field="booklet_index",
+        )
+
+    booklet = imposition["booklets"][booklet_index]
+    expected_sheets = booklet["sheets"]
+    expected_count = len(expected_sheets)
+    if len(sheets) < expected_count:
+        raise BindingCheckError(
+            f"缺纸：本册应有 {expected_count} 张纸，实际只记录了 {len(sheets)} 张。"
+        )
+    if len(sheets) > expected_count:
+        raise BindingCheckError(
+            f"纸张数量超出：本册应有 {expected_count} 张纸，实际记录了 {len(sheets)} 张。"
+        )
+
+    # 基准：非空页码集合 -> 应在位置（同一册内各纸页码集合互不重复）。
+    expected_by_pages = {}
+    for sheet in expected_sheets:
+        key = frozenset(page for page in _sheet_slots(sheet) if page is not None)
+        expected_by_pages[key] = sheet["index"]
+    start_page = booklet["start_page"]
+    end_page = booklet["end_page"]
+
+    checked: list[dict] = []
+    seen_positions: dict[frozenset[int], int] = {}
+    for position, sheet in enumerate(sheets):
+        pages = [page for page in _sheet_slots(sheet) if page is not None]
+        if not pages:
+            raise BindingCheckError(
+                f"第 {position} 张纸（从外到内，0 起）全部为空白（null），"
+                "无法按非空页码集合识别。"
+            )
+        outside = sorted({page for page in pages if not start_page <= page <= end_page})
+        if outside:
+            raise BindingCheckError(
+                f"第 {position} 张纸（从外到内，0 起）含跨册页 {outside}："
+                f"本册页码范围为 {start_page} 到 {end_page}。"
+            )
+        if len(set(pages)) != len(pages):
+            raise BindingCheckError(
+                f"第 {position} 张纸（从外到内，0 起）的页码 {sorted(pages)} 存在重复，"
+                "无法与拼版结果对应。"
+            )
+        key = frozenset(pages)
+        if key not in expected_by_pages:
+            raise BindingCheckError(
+                f"第 {position} 张纸（从外到内，0 起）的页码组合 {sorted(pages)} "
+                "与本册任何一张纸都不符，无法通过左右互换及正反互换还原。"
+            )
+        if key in seen_positions:
+            raise BindingCheckError(
+                f"重复纸：第 {seen_positions[key]} 张与第 {position} 张纸"
+                "（从外到内，0 起）的非空页码集合相同。"
+            )
+        seen_positions[key] = position
+
+        expected_index = expected_by_pages[key]
+        operations = _orientation_operations(expected_sheets[expected_index], sheet)
+        if operations is None:
+            raise BindingCheckError(
+                f"第 {position} 张纸（从外到内，0 起）的版面无法通过左右互换及"
+                "正反互换还原为拼版结果。"
+            )
+        checked.append(
+            {
+                "current_index": position,
+                "expected_index": expected_index,
+                "pages": sorted(pages),
+                "operations": operations,
+            }
+        )
+
+    swap_steps = _min_swap_steps([item["expected_index"] for item in checked])
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_booklet": max_sheets_per_booklet,
+        "booklet_index": booklet_index,
+        "booklet_count": booklet_count,
+        "sheet_count": expected_count,
+        "sheets": checked,
+        "swap_count": len(swap_steps),
+        "swap_steps": swap_steps,
     }

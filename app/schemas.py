@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -204,3 +204,87 @@ class ChapterImpositionResponse(BaseModel):
     total_sheets: int = Field(..., description="全部册合计用纸张数。")
     total_blank_pages: int = Field(..., description="全部册合计补位空白页数。")
     booklets: list[ChapterBookletLayout]
+
+
+class RecordedSidePages(BaseModel):
+    """待装订纸张某一面的左右页码记录；补白为 null。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: StrictInt | None = Field(
+        ..., ge=1, description="左侧页码；null 表示空白页，页码必须为正整数。"
+    )
+    right: StrictInt | None = Field(
+        ..., ge=1, description="右侧页码；null 表示空白页，页码必须为正整数。"
+    )
+
+
+class RecordedSheet(BaseModel):
+    """按当前从外到内顺序记录的一张待装订纸张。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    front: RecordedSidePages = Field(..., description="正面（朝外一面）左右页码。")
+    back: RecordedSidePages = Field(..., description="反面（朝内一面）左右页码。")
+
+
+class BindingCheckRequest(BaseModel):
+    """装订核对请求：分册参数、册序号与按当前从外到内顺序记录的纸张列表。"""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    total_pages: StrictInt = Field(
+        ..., ge=1, description="原稿总页数，必须为正整数。", examples=[16]
+    )
+    max_sheets_per_booklet: StrictInt = Field(
+        ...,
+        ge=1,
+        description="每册最多纸张数（1 张纸正反 4 个版面），必须为正整数。",
+        examples=[4],
+    )
+    booklet_index: StrictInt = Field(
+        ...,
+        ge=0,
+        description="待核对的分册序号，从 0 开始。",
+        examples=[0],
+    )
+    sheets: list[RecordedSheet] = Field(
+        ...,
+        description="按当前从外到内顺序记录的纸张列表，每张含 front、back 左右页码。",
+    )
+
+
+class BindingCheckSheetResult(BaseModel):
+    current_index: int = Field(..., description="该纸在提交顺序中的位置，0 为最外侧。")
+    expected_index: int = Field(..., description="该纸应在的位置，0 为最外侧。")
+    pages: list[int] = Field(
+        ..., description="该纸的非空页码（升序），即用于识别纸张的页码集合。"
+    )
+    operations: list[Literal["left_right", "front_back"]] = Field(
+        ...,
+        description=(
+            "还原该纸版面所需的互换操作：left_right 为左右互换、"
+            "front_back 为正反互换；空列表表示无需调整。"
+        ),
+    )
+
+
+class BindingCheckResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_booklet: int
+    booklet_index: int = Field(..., description="被核对的分册序号，从 0 开始。")
+    booklet_count: int = Field(..., description="分册数量。")
+    sheet_count: int = Field(..., description="本册应有纸张数。")
+    sheets: list[BindingCheckSheetResult] = Field(
+        ..., description="各纸核对结果，按提交的从外到内顺序排列。"
+    )
+    swap_count: int = Field(
+        ..., description="恢复外到内顺序所需的最少两两交换步数。"
+    )
+    swap_steps: list[list[int]] = Field(
+        ...,
+        description=(
+            "最少两两交换步骤；每步为一对升序位置（0 为最外侧），"
+            "等长方案按步骤序列字典序取最小。"
+        ),
+    )
