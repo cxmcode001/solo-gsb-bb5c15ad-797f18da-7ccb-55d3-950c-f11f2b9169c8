@@ -12,6 +12,11 @@
 章节不可拆分、仅相邻章节可合册，服务在所有合法分册方案中依次最小化**总纸张数**与
 **册数**，并以各册结束章节序号序列的字典序裁决并列。
 
+还支持**装订前核对单册纸张**（`POST /api/v1/binding-check`）：提交某册当前从外到内
+叠放的实际纸张，服务按非空页码集合识别每张纸，对缺纸、重复纸、跨册页或无法通过
+左右互换 / 正反互换还原的版面返回 **HTTP 400**；核对通过时给出每张纸当前与应在
+位置、所需互换操作，以及恢复外到内顺序的最少两两交换步骤。
+
 > 1 张纸正反两面共 4 个版面，因此骑马钉册的页数永远是 4 的倍数。
 
 ---
@@ -67,6 +72,7 @@ HOST_PORT=9000
 | 拼版接口（GET 便捷形式，可直接在浏览器打开） | `GET http://localhost:8000/api/v1/impose?total_pages=16&max_sheets_per_booklet=4` |
 | 补印定位接口（POST） | `POST http://localhost:8000/api/v1/reprint` |
 | 按章节分册拼版接口（POST） | `POST http://localhost:8000/api/v1/chapter-impose` |
+| 装订核对接口（POST） | `POST http://localhost:8000/api/v1/binding-check` |
 
 ## 4. 接口说明
 
@@ -368,6 +374,128 @@ curl -i -X POST http://localhost:8000/api/v1/chapter-impose \
 }
 ```
 
+### `POST /api/v1/binding-check`（单册装订核对）
+
+实际装订前，把**某一册当前从外到内叠放的一叠纸**提交给服务核对。服务以
+`/api/v1/impose` 的现有拼版结果为基准，按每张纸的**非空页码集合**识别纸张，
+判定每张纸：
+
+- **当前位置**（`current_index`，0 为最外侧）与**应在位置**（`expected_index`）；
+- 还原正确版面所需的互换操作：
+  - `swap_left_right`：左右互换（同一面左右两版对调，即纸张横向调头）；
+  - `swap_front_back`：正反互换（沿短边翻到另一面，左右位置不变，与双面打印
+    的翻页方式一致）；两者可单独或组合出现，无需调整时为空列表；
+- 整叠纸恢复为基准**外到内顺序**的**最少两两交换步骤** `swap_steps`
+  （交换两个叠放位置，`position_a < position_b`，0 为最外侧）；
+  存在多种等长方案时，按**步骤序列字典序**选择（先比第一步，再依次向后）。
+
+**请求体（JSON）**
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `total_pages` | 整数 | 必填，正整数 `>= 1` | 原稿总页数（与拼版接口口径一致） |
+| `max_sheets_per_booklet` | 整数 | 必填，正整数 `>= 1` | 每册最多纸张数（与拼版接口口径一致） |
+| `booklet_index` | 整数 | 必填，非负整数 | 待核对分册序号，从 0 开始 |
+| `sheets` | 纸张数组 | 必填，**至少一张** | 该册纸张，按**当前从外到内**顺序记录 |
+| `sheets[].front.left` / `front.right` | 整数或 `null` | 非空时为正整数 | 当前正面左 / 右原稿页码，补白为 `null` |
+| `sheets[].back.left` / `back.right` | 整数或 `null` | 非空时为正整数 | 当前反面左 / 右原稿页码，补白为 `null` |
+
+以下情况一律返回 **HTTP 400**（沿用统一错误格式，`details` 可含多条）：
+
+- **缺纸**：基准纸张在提交列表中缺失（或提交了基准中不存在的纸面 / 全白纸）；
+- **重复纸**：两张提交记录的非空页码集合相同；
+- **跨册页**：出现不属于该册原稿页区间的页码（含超出 `total_pages` 的越界页）；
+- **无法还原的版面**：纸张页码集合正确，但版面不能通过左右互换、正反互换
+  （及其组合）还原成基准版面。
+
+请求示例（16 页 1 册 4 张纸；当前顺序为第 2、3、1、4 张，即位置
+0→应在 1、位置 1→应在 2、位置 2→应在 0、位置 3 已就位）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/binding-check \
+  -H "Content-Type: application/json" \
+  -d '{
+        "total_pages": 16,
+        "max_sheets_per_booklet": 4,
+        "booklet_index": 0,
+        "sheets": [
+          { "front": { "left": 14, "right": 3 }, "back": { "left": 4,  "right": 13 } },
+          { "front": { "left": 12, "right": 5 }, "back": { "left": 6,  "right": 11 } },
+          { "front": { "left": 16, "right": 1 }, "back": { "left": 2,  "right": 15 } },
+          { "front": { "left": 10, "right": 7 }, "back": { "left": 8,  "right": 9 } }
+        ]
+      }'
+```
+
+响应示例（3 张错位纸构成一个循环，最少 2 次交换；字典序最小步骤为先交换
+位置 0、1，再交换位置 0、2）：
+
+```json
+{
+  "total_pages": 16,
+  "max_sheets_per_booklet": 4,
+  "booklet_index": 0,
+  "start_page": 1,
+  "end_page": 16,
+  "sheet_count": 4,
+  "sheets": [
+    {
+      "current_index": 0,
+      "expected_index": 1,
+      "required_operations": [],
+      "front": { "left": 14, "right": 3 },
+      "back":  { "left": 4,  "right": 13 }
+    },
+    {
+      "current_index": 1,
+      "expected_index": 2,
+      "required_operations": [],
+      "front": { "left": 12, "right": 5 },
+      "back":  { "left": 6,  "right": 11 }
+    },
+    {
+      "current_index": 2,
+      "expected_index": 0,
+      "required_operations": [],
+      "front": { "left": 16, "right": 1 },
+      "back":  { "left": 2,  "right": 15 }
+    },
+    {
+      "current_index": 3,
+      "expected_index": 3,
+      "required_operations": [],
+      "front": { "left": 10, "right": 7 },
+      "back":  { "left": 8,  "right": 9 }
+    }
+  ],
+  "swap_step_count": 2,
+  "swap_steps": [
+    { "position_a": 0, "position_b": 1 },
+    { "position_a": 0, "position_b": 2 }
+  ]
+}
+```
+
+含互换操作的例子：某张纸被**左右调头**提交为
+`front: 1 | 16, back: 15 | 2` 时，`required_operations` 为
+`["swap_left_right"]`；被**翻到反面**提交为
+`front: 2 | 15, back: 16 | 1` 时为 `["swap_front_back"]`；两者同时发生时为
+`["swap_front_back", "swap_left_right"]`。
+
+跨册页错误响应示例（17 页、每册 2 张纸，共 3 册；向第 0 册提交了属于第 1 册的
+第 9 页）：
+
+```json
+{
+  "error": "invalid_input",
+  "message": "装订核对失败：存在缺纸、重复纸、跨册页，或无法通过左右互换、正反互换还原的版面。",
+  "details": [
+    { "field": "sheets[1]", "message": "sheets[1] 含跨册（或越界）页码 [9]：第 0 册的原稿页区间为 1–8。" },
+    { "field": "sheets", "message": "缺少基准纸张：应在位置 1（从外到内，0 为最外侧）。" }
+  ]
+}
+```
+
 ## 5. 拼版规则（打印与装订说明）
 
 对一册补齐到 `n` 页（`n` 为 4 的倍数）的小册子，从外到内第 `i` 张纸
@@ -414,9 +542,9 @@ python -m unittest discover -s tests -v
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py      # 分册 / 补齐 / 拼版核心算法 + 补印定位 + 按章节最优分册（纯标准库）
-│   ├── schemas.py         # Pydantic 请求与响应模型（正整数 / 受损区间 / 章节容量校验）
-│   └── main.py            # FastAPI 路由（拼版、补印、按章节拼版）与 400 错误处理
+│   ├── imposition.py      # 分册 / 补齐 / 拼版核心算法 + 补印定位 + 按章节最优分册 + 装订核对（纯标准库）
+│   ├── schemas.py         # Pydantic 请求与响应模型（正整数 / 受损区间 / 章节容量 / 装订核对校验）
+│   └── main.py            # FastAPI 路由（拼版、补印、按章节拼版、装订核对）与 400 错误处理
 ├── tests/
 │   ├── test_imposition.py # 核心算法单元测试
 │   └── test_api.py        # API 与非法输入测试

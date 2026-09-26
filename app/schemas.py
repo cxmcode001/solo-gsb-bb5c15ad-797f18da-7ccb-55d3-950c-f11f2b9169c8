@@ -204,3 +204,92 @@ class ChapterImpositionResponse(BaseModel):
     total_sheets: int = Field(..., description="全部册合计用纸张数。")
     total_blank_pages: int = Field(..., description="全部册合计补位空白页数。")
     booklets: list[ChapterBookletLayout]
+
+
+# 允许 null 的严格正整数页码：拒绝 0、负数、小数、布尔值、数字字符串。
+NullableStrictPage = Annotated[StrictInt, Field(ge=1)]
+
+
+class BindingCheckSidePages(BaseModel):
+    """装订核对输入的一面：左右原稿页码，补白为 null。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: NullableStrictPage | None = Field(..., description="左侧页码；null 表示空白页。")
+    right: NullableStrictPage | None = Field(..., description="右侧页码；null 表示空白页。")
+
+
+class BindingCheckSheetInput(BaseModel):
+    """待装订纸张：记录当前摆放方式下正反面左右原稿页码。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    front: BindingCheckSidePages = Field(..., description="当前正面（朝外一面）左右页码。")
+    back: BindingCheckSidePages = Field(..., description="当前反面（朝内一面）左右页码。")
+
+
+class BindingCheckRequest(BaseModel):
+    """装订核对请求：分册参数、册序号与该册当前从外到内的纸张列表。
+
+    ``sheets`` 至少一张；纸张以非空页码集合识别，结构语义（缺纸 / 重复纸 /
+    跨册页 / 版面无法还原）在核心算法层核对并返回 400。
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    total_pages: StrictInt = Field(
+        ..., ge=1, description="原稿总页数，必须为正整数。", examples=[16]
+    )
+    max_sheets_per_booklet: StrictInt = Field(
+        ...,
+        ge=1,
+        description="每册最多纸张数（1 张纸正反 4 个版面），必须为正整数。",
+        examples=[4],
+    )
+    booklet_index: StrictInt = Field(
+        ..., ge=0, description="待核对分册的序号，从 0 开始，必须为非负整数。"
+    )
+    sheets: list[BindingCheckSheetInput] = Field(
+        ...,
+        min_length=1,
+        description="该册纸张，按当前从外到内顺序记录；每张给出正反面左右页码，补白为 null。",
+    )
+
+
+class BindingCheckSheetResult(BaseModel):
+    current_index: int = Field(..., description="该纸当前所在位置（0 为最外侧）。")
+    expected_index: int = Field(..., description="该纸按拼版结果应在位置（0 为最外侧）。")
+    required_operations: list[str] = Field(
+        ...,
+        description=(
+            "还原该纸版面所需互换操作，仅可能包含 swap_left_right（左右互换）"
+            "与 swap_front_back（正反互换）；无需调整时为空列表。"
+        ),
+    )
+    front: SidePages = Field(..., description="该纸当前正面（朝外一面）左右页码。")
+    back: SidePages = Field(..., description="该纸当前反面（朝内一面）左右页码。")
+
+
+class BindingCheckSwapStep(BaseModel):
+    position_a: int = Field(..., description="本次两两交换的位置 a（0 为最外侧，恒有 a < b）。")
+    position_b: int = Field(..., description="本次两两交换的位置 b。")
+
+
+class BindingCheckResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_booklet: int
+    booklet_index: int = Field(..., description="核对的分册序号。")
+    start_page: int = Field(..., description="该册起始原稿页码（含）。")
+    end_page: int = Field(..., description="该册结束原稿页码（含）。")
+    sheet_count: int = Field(..., description="该册基准纸张数。")
+    sheets: list[BindingCheckSheetResult] = Field(
+        ..., description="各纸核对结果，按提交顺序（当前从外到内）排列。"
+    )
+    swap_step_count: int = Field(..., description="恢复外到内顺序所需最少两两交换次数。")
+    swap_steps: list[BindingCheckSwapStep] = Field(
+        ...,
+        description=(
+            "最少两两交换步骤序列（等长方案按步骤序列字典序选择）；"
+            "依次执行后整叠纸恢复为基准的从外到内顺序。"
+        ),
+    )

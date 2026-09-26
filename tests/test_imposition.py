@@ -1,9 +1,12 @@
 """拼版核心算法单元测试（仅依赖标准库，可直接 `python -m unittest` 运行）。"""
 
+import itertools
 import unittest
 
 from app.imposition import (
+    BindingCheckError,
     ChapterTooLargeError,
+    build_binding_check,
     build_chapter_imposition,
     build_imposition,
     build_reprint,
@@ -405,6 +408,240 @@ class TestBuildReprint(unittest.TestCase):
         result = build_reprint(16, 4, [(15, 16)])
         self.assertEqual(result["total_pages"], 16)
         self.assertEqual(result["max_sheets_per_booklet"], 4)
+
+
+def _orient(sheet, swap_sides: bool, swap_left_right: bool):
+    """对一张纸施加正反互换 / 左右互换，返回新的纸张字典。"""
+    fl = sheet["front"]["left"]
+    fr = sheet["front"]["right"]
+    bl = sheet["back"]["left"]
+    br = sheet["back"]["right"]
+    if swap_sides:
+        fl, fr, bl, br = bl, br, fl, fr
+    if swap_left_right:
+        fl, fr, bl, br = fr, fl, br, bl
+    return {"front": {"left": fl, "right": fr}, "back": {"left": bl, "right": br}}
+
+
+class TestBuildBindingCheck(unittest.TestCase):
+    """装订核对：基准为 16 页 1 册 4 张纸。"""
+
+    S0 = {"front": {"left": 16, "right": 1}, "back": {"left": 2, "right": 15}}
+    S1 = {"front": {"left": 14, "right": 3}, "back": {"left": 4, "right": 13}}
+    S2 = {"front": {"left": 12, "right": 5}, "back": {"left": 6, "right": 11}}
+    S3 = {"front": {"left": 10, "right": 7}, "back": {"left": 8, "right": 9}}
+    BASE = [S0, S1, S2, S3]
+
+    def check(self, sheets, booklet_index=0, **kw):
+        return build_binding_check(
+            total_pages=kw.get("total_pages", 16),
+            max_sheets_per_booklet=kw.get("max_sheets_per_booklet", 4),
+            booklet_index=booklet_index,
+            sheets=sheets,
+        )
+
+    def test_perfect_stack_needs_nothing(self):
+        result = self.check([dict(s) for s in self.BASE])
+        self.assertEqual(result["sheet_count"], 4)
+        self.assertEqual(result["start_page"], 1)
+        self.assertEqual(result["end_page"], 16)
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"], s["required_operations"])
+             for s in result["sheets"]],
+            [(0, 0, []), (1, 1, []), (2, 2, []), (3, 3, [])],
+        )
+        self.assertEqual(result["swap_step_count"], 0)
+        self.assertEqual(result["swap_steps"], [])
+
+    def test_all_four_orientations_recognized(self):
+        # 每张基准纸以四种摆放方式提交，均应识别且给出正确操作。
+        variants = [
+            (False, False, []),
+            (False, True, ["swap_left_right"]),
+            (True, False, ["swap_front_back"]),
+            (True, True, ["swap_front_back", "swap_left_right"]),
+        ]
+        for target_index, (swap_sides, swap_lr, expected_ops) in enumerate(variants):
+            target = self.BASE[target_index]
+            placed = [dict(s) for s in self.BASE]
+            placed[target_index] = _orient(target, swap_sides, swap_lr)
+            result = self.check(placed)
+            sheet = next(s for s in result["sheets"] if s["expected_index"] == target_index)
+            self.assertEqual(sheet["required_operations"], expected_ops)
+            self.assertEqual(result["swap_step_count"], 0)
+
+    def test_reversed_two_sheets_one_swap(self):
+        # 当前顺序 [S1, S0, S2, S3] -> 一次交换 (0,1)
+        result = self.check([dict(self.S1), dict(self.S0), dict(self.S2), dict(self.S3)])
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"]) for s in result["sheets"]],
+            [(0, 1), (1, 0), (2, 2), (3, 3)],
+        )
+        self.assertEqual(result["swap_step_count"], 1)
+        self.assertEqual(
+            result["swap_steps"], [{"position_a": 0, "position_b": 1}]
+        )
+
+    def test_three_cycle_lexicographic_steps(self):
+        # 当前顺序 [S1, S2, S0, S3]：最小 2 步，字典序最小序列 (0,1) 后 (0,2)
+        result = self.check([dict(self.S1), dict(self.S2), dict(self.S0), dict(self.S3)])
+        self.assertEqual(result["swap_step_count"], 2)
+        self.assertEqual(
+            [(s["position_a"], s["position_b"]) for s in result["swap_steps"]],
+            [(0, 1), (0, 2)],
+        )
+
+    def test_missing_sheet_rejected(self):
+        with self.assertRaises(BindingCheckError) as ctx:
+            self.check([dict(self.S0), dict(self.S1), dict(self.S3)])
+        messages = [d["message"] for d in ctx.exception.details]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("缺少基准纸张", messages[0])
+        self.assertIn("位置 2", messages[0])
+
+    def test_duplicate_sheet_rejected(self):
+        with self.assertRaises(BindingCheckError) as ctx:
+            self.check([dict(self.S0), dict(self.S0), dict(self.S2), dict(self.S3)])
+        messages = [d["message"] for d in ctx.exception.details]
+        self.assertTrue(any("重复" in m for m in messages))
+        self.assertTrue(any("缺少基准纸张" in m and "位置 1" in m for m in messages))
+
+    def test_cross_booklet_page_rejected(self):
+        # 17 页、每册 2 张纸：第 0 册区间 1..8，页码 9 属于第 1 册
+        s0 = {"front": {"left": 8, "right": 1}, "back": {"left": 2, "right": 7}}
+        s1 = {"front": {"left": 6, "right": 3}, "back": {"left": 4, "right": 5}}
+        foreign = {"front": {"left": 9, "right": 3}, "back": {"left": 4, "right": 5}}
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(17, 2, 0, [s0, foreign])
+        messages = [d["message"] for d in ctx.exception.details]
+        self.assertTrue(any("跨册" in m and "9" in m for m in messages))
+
+    def test_out_of_range_page_rejected(self):
+        with self.assertRaises(BindingCheckError) as ctx:
+            self.check(
+                [
+                    {"front": {"left": 17, "right": 1}, "back": {"left": 2, "right": 15}},
+                    dict(self.S1), dict(self.S2), dict(self.S3),
+                ]
+            )
+        self.assertTrue(
+            any("跨册" in m or "越界" in m for m in
+                [d["message"] for d in ctx.exception.details])
+        )
+
+    def test_unrestorable_layout_rejected(self):
+        # 页码集合与 S0 相同（{1,2,15,16}），但配对方式不在四种摆放之内
+        bad = {"front": {"left": 16, "right": 15}, "back": {"left": 1, "right": 2}}
+        with self.assertRaises(BindingCheckError) as ctx:
+            self.check([bad, dict(self.S1), dict(self.S2), dict(self.S3)])
+        messages = [d["message"] for d in ctx.exception.details]
+        self.assertTrue(any("无法通过左右互换及正反互换还原" in m for m in messages))
+        # 物理纸并未缺失：不应再报 S0 缺纸
+        self.assertFalse(any("缺少基准纸张：应在位置 0" in m for m in messages))
+
+    def test_unknown_sheet_and_missing_rejected(self):
+        # 页码集合 {1,3,13,15} 横跨 S0/S1，不属于本册任何一张基准纸
+        weird = {"front": {"left": 15, "right": 1}, "back": {"left": 3, "right": 13}}
+        with self.assertRaises(BindingCheckError) as ctx:
+            self.check([weird, dict(self.S1), dict(self.S2), dict(self.S3)])
+        messages = [d["message"] for d in ctx.exception.details]
+        self.assertTrue(any("不属于第 0 册的任何基准纸张" in m for m in messages))
+        self.assertTrue(any("缺少基准纸张" in m for m in messages))
+
+    def test_booklet_index_out_of_range(self):
+        with self.assertRaises(BindingCheckError) as ctx:
+            self.check([dict(s) for s in self.BASE], booklet_index=1)
+        self.assertEqual(ctx.exception.details[0]["field"], "booklet_index")
+
+    def test_padded_booklet_with_nulls(self):
+        # 5 页补齐到 8：S0 = null|1 / 2|null，S1 = null|3 / 4|5
+        s0 = {"front": {"left": None, "right": 1}, "back": {"left": 2, "right": None}}
+        s1 = {"front": {"left": None, "right": 3}, "back": {"left": 4, "right": 5}}
+        # 顺序颠倒且 S1 左右互换：front 3|null / 5|4
+        s1_lr = {"front": {"left": 3, "right": None}, "back": {"left": 5, "right": 4}}
+        result = build_binding_check(5, 10, 0, [s1_lr, s0])
+        self.assertEqual(result["sheet_count"], 2)
+        self.assertEqual(result["sheets"][0]["expected_index"], 1)
+        self.assertEqual(
+            result["sheets"][0]["required_operations"], ["swap_left_right"]
+        )
+        self.assertEqual(
+            result["swap_steps"], [{"position_a": 0, "position_b": 1}]
+        )
+
+    def test_blank_only_sheet_rejected(self):
+        s0 = {"front": {"left": None, "right": 1}, "back": {"left": 2, "right": None}}
+        blank = {
+            "front": {"left": None, "right": None},
+            "back": {"left": None, "right": None},
+        }
+        with self.assertRaises(BindingCheckError) as ctx:
+            build_binding_check(5, 10, 0, [s0, blank])
+        self.assertTrue(
+            any("不属于第 0 册的任何基准纸张" in d["message"]
+                for d in ctx.exception.details)
+        )
+
+    def test_multi_booklet_last_booklet(self):
+        # 17 页、每册 2 张：第 2 册仅第 17 页，唯一纸 null|17 / null|null
+        sheet = {"front": {"left": None, "right": 17},
+                 "back": {"left": None, "right": None}}
+        result = build_binding_check(17, 2, 2, [sheet])
+        self.assertEqual((result["start_page"], result["end_page"]), (17, 17))
+        self.assertEqual(result["sheets"][0]["required_operations"], [])
+        self.assertEqual(result["swap_steps"], [])
+
+
+class TestMinimumSwapSteps(unittest.TestCase):
+    """对所有小规模排列穷举校验：交换数最小且步骤序列字典序最小。"""
+
+    @staticmethod
+    def _min_swaps(perm):
+        return build_binding_check.__globals__["_minimum_swaps_to_identity"](perm)
+
+    @staticmethod
+    def _brute_lex_min(perm):
+        from collections import deque
+
+        def apply(state, a, b):
+            ia, ib = state.index(a), state.index(b)
+            s = list(state)
+            s[ia], s[ib] = s[ib], s[ia]
+            return tuple(s)
+
+        start, target = tuple(perm), tuple(range(len(perm)))
+        frontier = deque([(start, [])])
+        seen = {start}
+        while frontier:
+            next_frontier = []
+            batch = sorted(frontier, key=lambda item: item[1])
+            for state, path in batch:
+                if state == target:
+                    return path
+                n = len(perm)
+                for a in range(n):
+                    for b in range(a + 1, n):
+                        ns = apply(state, a, b)
+                        if ns not in seen:
+                            seen.add(ns)
+                            next_frontier.append((ns, path + [(a, b)]))
+            frontier = deque(next_frontier)
+        raise AssertionError
+
+    def test_all_permutations_up_to_six(self):
+        for n in range(1, 7):
+            for perm in itertools.permutations(range(n)):
+                steps = self._min_swaps(perm)
+                expected = self._brute_lex_min(perm)
+                got = [(s["position_a"], s["position_b"]) for s in steps]
+                self.assertEqual(got, expected, f"perm={perm}")
+                # 逐步执行后应回到恒等排列
+                state = list(perm)
+                for a, b in got:
+                    ia = next(i for i, p in enumerate(state) if p == a)
+                    ib = next(i for i, p in enumerate(state) if p == b)
+                    state[ia], state[ib] = state[ib], state[ia]
+                self.assertEqual(state, list(range(n)))
 
 
 if __name__ == "__main__":

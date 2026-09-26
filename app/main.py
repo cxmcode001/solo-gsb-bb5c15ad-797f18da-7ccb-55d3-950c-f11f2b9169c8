@@ -7,12 +7,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .imposition import (
+    BindingCheckError,
     ChapterTooLargeError,
+    build_binding_check,
     build_chapter_imposition,
     build_imposition,
     build_reprint,
 )
 from .schemas import (
+    BindingCheckRequest,
+    BindingCheckResponse,
     ChapterImpositionRequest,
     ChapterImpositionResponse,
     ImpositionRequest,
@@ -29,7 +33,7 @@ app = FastAPI(
         "亦支持按章节分册：章节不可拆分、仅相邻章节可合册，"
         "在所有合法分册方案中依次最小化总纸张数与册数。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -53,9 +57,15 @@ def _format_validation_errors(errors: list[dict], path: str = "") -> list[dict]:
             "int_from_float",
             "bool_type",
         }:
-            message = "必须为正整数（不接受小数、布尔值、字符串或空值）。"
+            if field == "booklet_index":
+                message = "必须为非负整数（不接受小数、布尔值、字符串或空值）。"
+            else:
+                message = "必须为正整数（不接受小数、布尔值、字符串或空值）。"
         elif err_type in {"greater_than_equal", "ge"}:
-            message = "必须为大于等于 1 的正整数。"
+            if field == "booklet_index":
+                message = "必须为大于等于 0 的非负整数。"
+            else:
+                message = "必须为大于等于 1 的正整数。"
         elif err_type == "extra_forbidden":
             message = "存在不支持的多余字段。"
         elif err_type == "missing":
@@ -66,14 +76,20 @@ def _format_validation_errors(errors: list[dict], path: str = "") -> list[dict]:
                 message = "受损页区间列表的每一项都必须是含 start_page、end_page 的对象。"
             elif field == "damaged_ranges":
                 message = "damaged_ranges 必须是区间对象组成的列表。"
+            else:
+                message = "每一张纸都必须是含 front、back 的对象，且两面各自包含 left、right。"
         elif err_type == "list_type":
             if field == "chapter_pages":
                 message = "chapter_pages 必须是由正整数页数组成的数组。"
+            elif field == "sheets":
+                message = "sheets 必须是纸张对象组成的非空列表。"
             else:
                 message = "damaged_ranges 必须是区间对象组成的非空列表。"
         elif err_type in {"too_short", "string_too_short"}:
             if field == "chapter_pages":
                 message = "chapter_pages 不能为空，至少提供一个章节页数。"
+            elif field == "sheets":
+                message = "sheets 不能为空，至少提供一张待装订纸张。"
             else:
                 message = "damaged_ranges 不能为空，至少提供一个受损页区间。"
         elif err_type in {"reversed_range", "page_out_of_range", "chapter_too_large"}:
@@ -100,6 +116,12 @@ async def validation_exception_handler(
             "输入参数校验失败：total_pages 与 max_sheets_per_booklet 必须是正整数，"
             "damaged_ranges 必须为非空的有效受损页区间列表。"
         )
+    elif path.startswith("/api/v1/binding-check"):
+        message = (
+            "输入参数校验失败：total_pages 与 max_sheets_per_booklet 必须是正整数，"
+            "booklet_index 必须是非负整数，"
+            "sheets 必须是非空的纸张列表，每张纸的非空页码必须为正整数。"
+        )
     else:
         message = (
             "输入参数校验失败：total_pages 与 max_sheets_per_booklet 必须是正整数。"
@@ -123,6 +145,7 @@ async def root() -> dict:
         "impose_endpoint": "/api/v1/impose",
         "reprint_endpoint": "/api/v1/reprint",
         "chapter_impose_endpoint": "/api/v1/chapter-impose",
+        "binding_check_endpoint": "/api/v1/binding-check",
     }
 
 
@@ -204,3 +227,44 @@ async def chapter_impose(
             },
         )
     return ChapterImpositionResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/binding-check",
+    response_model=BindingCheckResponse,
+    tags=["binding"],
+    summary="核对单册待装订纸张（缺纸 / 重复纸 / 跨册页 / 版面互换还原）",
+)
+async def binding_check(payload: BindingCheckRequest) -> BindingCheckResponse:
+    try:
+        result = build_binding_check(
+            total_pages=payload.total_pages,
+            max_sheets_per_booklet=payload.max_sheets_per_booklet,
+            booklet_index=payload.booklet_index,
+            sheets=[
+                {
+                    "front": {
+                        "left": item.front.left,
+                        "right": item.front.right,
+                    },
+                    "back": {
+                        "left": item.back.left,
+                        "right": item.back.right,
+                    },
+                }
+                for item in payload.sheets
+            ],
+        )
+    except BindingCheckError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_input",
+                "message": (
+                    "装订核对失败：存在缺纸、重复纸、跨册页，或无法通过左右互换、"
+                    "正反互换还原的版面。"
+                ),
+                "details": exc.details,
+            },
+        )
+    return BindingCheckResponse.model_validate(result)

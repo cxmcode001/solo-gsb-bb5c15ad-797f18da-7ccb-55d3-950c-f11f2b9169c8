@@ -393,5 +393,227 @@ class TestChapterImposeEndpoint(unittest.TestCase):
                 self.assertIn("details", body)
 
 
+class TestBindingCheckEndpoint(unittest.TestCase):
+    URL = "/api/v1/binding-check"
+
+    # 16 页 1 册 4 张纸的基准拼版
+    S0 = {"front": {"left": 16, "right": 1}, "back": {"left": 2, "right": 15}}
+    S1 = {"front": {"left": 14, "right": 3}, "back": {"left": 4, "right": 13}}
+    S2 = {"front": {"left": 12, "right": 5}, "back": {"left": 6, "right": 11}}
+    S3 = {"front": {"left": 10, "right": 7}, "back": {"left": 8, "right": 9}}
+
+    def test_perfect_stack(self):
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 16,
+                "max_sheets_per_booklet": 4,
+                "booklet_index": 0,
+                "sheets": [self.S0, self.S1, self.S2, self.S3],
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["booklet_index"], 0)
+        self.assertEqual((data["start_page"], data["end_page"]), (1, 16))
+        self.assertEqual(data["sheet_count"], 4)
+        self.assertEqual(
+            [(s["current_index"], s["expected_index"], s["required_operations"])
+             for s in data["sheets"]],
+            [(0, 0, []), (1, 1, []), (2, 2, []), (3, 3, [])],
+        )
+        self.assertEqual(data["swap_step_count"], 0)
+        self.assertEqual(data["swap_steps"], [])
+
+    def test_mixed_orientations_and_swaps(self):
+        # 位置 0 放 S1（原样），位置 1 放 S0 但左右互换，
+        # 位置 2 放 S2 但正反互换，位置 3 放 S3 且同时互换。
+        payload = {
+            "total_pages": 16,
+            "max_sheets_per_booklet": 4,
+            "booklet_index": 0,
+            "sheets": [
+                self.S1,
+                {"front": {"left": 1, "right": 16}, "back": {"left": 15, "right": 2}},
+                {"front": {"left": 6, "right": 11}, "back": {"left": 12, "right": 5}},
+                {"front": {"left": 9, "right": 8}, "back": {"left": 7, "right": 10}},
+            ],
+        }
+        resp = client.post(self.URL, json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(
+            [s["required_operations"] for s in data["sheets"]],
+            [
+                [],
+                ["swap_left_right"],
+                ["swap_front_back"],
+                ["swap_front_back", "swap_left_right"],
+            ],
+        )
+        self.assertEqual(data["swap_step_count"], 1)
+        self.assertEqual(
+            data["swap_steps"], [{"position_a": 0, "position_b": 1}]
+        )
+
+    def test_three_cycle_swap_sequence(self):
+        # 当前顺序 S1, S2, S0, S3 -> 最少 2 步，字典序最小 (0,1),(0,2)
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 16,
+                "max_sheets_per_booklet": 4,
+                "booklet_index": 0,
+                "sheets": [self.S1, self.S2, self.S0, self.S3],
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["swap_step_count"], 2)
+        self.assertEqual(
+            [(s["position_a"], s["position_b"]) for s in data["swap_steps"]],
+            [(0, 1), (0, 2)],
+        )
+
+    def test_null_padding_accepted(self):
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 5,
+                "max_sheets_per_booklet": 10,
+                "booklet_index": 0,
+                "sheets": [
+                    {"front": {"left": None, "right": 1},
+                     "back": {"left": 2, "right": None}},
+                    {"front": {"left": None, "right": 3},
+                     "back": {"left": 4, "right": 5}},
+                ],
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["swap_step_count"], 0)
+
+    def test_missing_sheet_400(self):
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 16,
+                "max_sheets_per_booklet": 4,
+                "booklet_index": 0,
+                "sheets": [self.S0, self.S1, self.S3],
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        body = resp.json()
+        self.assertEqual(body["error"], "invalid_input")
+        self.assertTrue(any("缺少基准纸张" in d["message"] for d in body["details"]))
+
+    def test_duplicate_sheet_400(self):
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 16,
+                "max_sheets_per_booklet": 4,
+                "booklet_index": 0,
+                "sheets": [self.S0, self.S0, self.S2, self.S3],
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(
+            any("同一张纸" in d["message"] for d in resp.json()["details"])
+        )
+
+    def test_cross_booklet_page_400(self):
+        # 17 页每册 2 张：册 0 区间 1..8，第 9 页属册 1
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 17,
+                "max_sheets_per_booklet": 2,
+                "booklet_index": 0,
+                "sheets": [
+                    {"front": {"left": 8, "right": 1},
+                     "back": {"left": 2, "right": 7}},
+                    {"front": {"left": 9, "right": 3},
+                     "back": {"left": 4, "right": 5}},
+                ],
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(
+            any("跨册" in d["message"] for d in resp.json()["details"])
+        )
+
+    def test_unrestorable_layout_400(self):
+        bad = {"front": {"left": 16, "right": 15}, "back": {"left": 1, "right": 2}}
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 16,
+                "max_sheets_per_booklet": 4,
+                "booklet_index": 0,
+                "sheets": [bad, self.S1, self.S2, self.S3],
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(
+            any("无法通过左右互换及正反互换还原" in d["message"]
+                for d in resp.json()["details"])
+        )
+
+    def test_booklet_index_out_of_range_400(self):
+        resp = client.post(
+            self.URL,
+            json={
+                "total_pages": 16,
+                "max_sheets_per_booklet": 4,
+                "booklet_index": 3,
+                "sheets": [self.S0, self.S1, self.S2, self.S3],
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["details"][0]["field"], "booklet_index")
+
+    def test_payload_validation_400(self):
+        valid = {
+            "total_pages": 16,
+            "max_sheets_per_booklet": 4,
+            "booklet_index": 0,
+            "sheets": [self.S0, self.S1, self.S2, self.S3],
+        }
+        cases = [
+            {},  # 缺少必填参数
+            {**valid, "total_pages": 0},  # 非正
+            {**valid, "max_sheets_per_booklet": -2},  # 负数
+            {**valid, "booklet_index": -1},  # 负册序
+            {**valid, "booklet_index": 1.0},  # 整数浮点
+            {**valid, "total_pages": True},  # 布尔
+            {**{**valid, "sheets": []}},  # 空 sheets
+            {**valid, "sheets": "x"},  # sheets 非数组
+            {**valid, "sheets": [{"front": {"left": 16, "right": 1}}]},  # 缺 back
+            {**valid, "sheets": [{"front": {"left": 16, "right": 1},
+                                  "back": {"left": 2, "right": 15},
+                                  "note": "x"}]},  # 多余字段
+            {**valid, "sheets": [
+                {"front": {"left": 0, "right": 1},
+                 "back": {"left": 2, "right": 15}},
+                self.S1, self.S2, self.S3,
+            ]},  # 页码 0
+            {**valid, "sheets": [
+                {"front": {"left": "16", "right": 1},
+                 "back": {"left": 2, "right": 15}},
+                self.S1, self.S2, self.S3,
+            ]},  # 数字字符串页码
+            {**valid, "extra": 1},  # 顶层多余字段
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                resp = client.post(self.URL, json=payload)
+                self.assertEqual(resp.status_code, 400, payload)
+                body = resp.json()
+                self.assertEqual(body["error"], "invalid_input")
+                self.assertIn("details", body)
+
+
 if __name__ == "__main__":
     unittest.main()
