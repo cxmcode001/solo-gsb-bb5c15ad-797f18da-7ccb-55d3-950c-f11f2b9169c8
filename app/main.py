@@ -1,0 +1,206 @@
+"""FastAPI 入口：骑马钉小册子拼版 API。"""
+
+from __future__ import annotations
+
+from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from .imposition import (
+    ChapterTooLargeError,
+    build_chapter_imposition,
+    build_imposition,
+    build_reprint,
+)
+from .schemas import (
+    ChapterImpositionRequest,
+    ChapterImpositionResponse,
+    ImpositionRequest,
+    ImpositionResponse,
+    ReprintRequest,
+    ReprintResponse,
+)
+
+app = FastAPI(
+    title="骑马钉小册子拼版 API",
+    description=(
+        "输入原稿总页数与每册最多纸张数，按骑马钉（对折装订）方式分册拼版，"
+        "返回每张纸正反面各自的左、右页码；补位页以 null（空白）表示。"
+        "亦支持按章节分册：章节不可拆分、仅相邻章节可合册，"
+        "在所有合法分册方案中依次最小化总纸张数与册数。"
+    ),
+    version="1.1.0",
+)
+
+
+def _format_validation_errors(errors: list[dict], path: str = "") -> list[dict]:
+    """把 Pydantic 校验错误整理成简洁的中文说明。"""
+    formatted: list[dict] = []
+    for err in errors:
+        loc = [
+            str(part)
+            for part in err.get("loc", [])
+            if part not in ("body", "query")
+        ]
+        field = ".".join(loc) if loc else "请求体"
+        err_type = err.get("type", "")
+        message = err.get("msg", "参数不合法。")
+
+        if err_type in {
+            "int_type",
+            "int_parsing",
+            "strict_int",
+            "int_from_float",
+            "bool_type",
+        }:
+            message = "必须为正整数（不接受小数、布尔值、字符串或空值）。"
+        elif err_type in {"greater_than_equal", "ge"}:
+            message = "必须为大于等于 1 的正整数。"
+        elif err_type == "extra_forbidden":
+            message = "存在不支持的多余字段。"
+        elif err_type == "missing":
+            message = "缺少必填参数。"
+        elif err_type in {"model_type", "model_attributes_type"}:
+            raw_loc = err.get("loc", ())
+            if len(raw_loc) >= 2 and "damaged_ranges" in raw_loc:
+                message = "受损页区间列表的每一项都必须是含 start_page、end_page 的对象。"
+            elif field == "damaged_ranges":
+                message = "damaged_ranges 必须是区间对象组成的列表。"
+        elif err_type == "list_type":
+            if field == "chapter_pages":
+                message = "chapter_pages 必须是由正整数页数组成的数组。"
+            else:
+                message = "damaged_ranges 必须是区间对象组成的非空列表。"
+        elif err_type in {"too_short", "string_too_short"}:
+            if field == "chapter_pages":
+                message = "chapter_pages 不能为空，至少提供一个章节页数。"
+            else:
+                message = "damaged_ranges 不能为空，至少提供一个受损页区间。"
+        elif err_type in {"reversed_range", "page_out_of_range", "chapter_too_large"}:
+            message = message.removeprefix("Value error, ")
+
+        formatted.append({"field": field, "message": message})
+    return formatted
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """类型 / 范围 / 区间错误统一返回 HTTP 400 与明确错误信息。"""
+    path = request.url.path
+    if path.startswith("/api/v1/chapter-impose"):
+        message = (
+            "输入参数校验失败：chapter_pages 必须为非空的正整数页数数组，"
+            "max_sheets_per_booklet 必须是正整数，"
+            "且任一章节页数不能超过 4 × max_sheets_per_booklet。"
+        )
+    elif path.startswith("/api/v1/reprint"):
+        message = (
+            "输入参数校验失败：total_pages 与 max_sheets_per_booklet 必须是正整数，"
+            "damaged_ranges 必须为非空的有效受损页区间列表。"
+        )
+    else:
+        message = (
+            "输入参数校验失败：total_pages 与 max_sheets_per_booklet 必须是正整数。"
+        )
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "invalid_input",
+            "message": message,
+            "details": _format_validation_errors(exc.errors(), path),
+        },
+    )
+
+
+@app.get("/", tags=["meta"])
+async def root() -> dict:
+    return {
+        "service": "saddle-stitch-imposition",
+        "docs": "/docs",
+        "health": "/health",
+        "impose_endpoint": "/api/v1/impose",
+        "reprint_endpoint": "/api/v1/reprint",
+        "chapter_impose_endpoint": "/api/v1/chapter-impose",
+    }
+
+
+@app.get("/health", tags=["meta"])
+async def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post(
+    "/api/v1/impose",
+    response_model=ImpositionResponse,
+    tags=["imposition"],
+    summary="骑马钉拼版",
+)
+async def impose(payload: ImpositionRequest) -> ImpositionResponse:
+    result = build_imposition(
+        total_pages=payload.total_pages,
+        max_sheets_per_booklet=payload.max_sheets_per_booklet,
+    )
+    return ImpositionResponse.model_validate(result)
+
+
+@app.get(
+    "/api/v1/impose",
+    response_model=ImpositionResponse,
+    tags=["imposition"],
+    summary="骑马钉拼版（GET 便捷形式，可直接在浏览器中查看）",
+)
+async def impose_get(
+    total_pages: int = Query(..., ge=1, description="原稿总页数，正整数。"),
+    max_sheets_per_booklet: int = Query(
+        ..., ge=1, description="每册最多纸张数，正整数。"
+    ),
+) -> ImpositionResponse:
+    # 查询参数的类型 / 范围错误同样由 validation_exception_handler 统一返回 400。
+    result = build_imposition(total_pages, max_sheets_per_booklet)
+    return ImpositionResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/reprint",
+    response_model=ReprintResponse,
+    tags=["reprint"],
+    summary="按受损页区间定位需补印的整张纸",
+)
+async def reprint(payload: ReprintRequest) -> ReprintResponse:
+    result = build_reprint(
+        total_pages=payload.total_pages,
+        max_sheets_per_booklet=payload.max_sheets_per_booklet,
+        damaged_ranges=[
+            (item.start_page, item.end_page) for item in payload.damaged_ranges
+        ],
+    )
+    return ReprintResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/chapter-impose",
+    response_model=ChapterImpositionResponse,
+    tags=["imposition"],
+    summary="按章节分册的骑马钉拼版（章节不可拆分，仅相邻章节可合册）",
+)
+async def chapter_impose(
+    payload: ChapterImpositionRequest,
+) -> ChapterImpositionResponse:
+    try:
+        result = build_chapter_imposition(
+            chapter_pages=payload.chapter_pages,
+            max_sheets_per_booklet=payload.max_sheets_per_booklet,
+        )
+    except ChapterTooLargeError as exc:
+        # 单章超容量在 schema 层已拦截，此处兜底保证仍返回 400 而非 500。
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_input",
+                "message": str(exc),
+                "details": [{"field": "chapter_pages", "message": str(exc)}],
+            },
+        )
+    return ChapterImpositionResponse.model_validate(result)
